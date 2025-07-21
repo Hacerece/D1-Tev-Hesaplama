@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import re
 from io import BytesIO
 from pandas import DataFrame
 from openpyxl.utils import column_index_from_string
@@ -135,9 +136,8 @@ COLUMNS_EXPORT = {
     "AR": "E-Eur1 Tarihi",
     "AS": "Eur1med",
     "AT": "Eur1Med Tarihi",
-    "AU": "E-Eur1med",
-    "AV": "E-Eur1med Tarihi",
-    "AW": "Eur1 Fatura",
+    "AU": "E-Eur1med Tarihi",
+    "AV": "Eur1 Fatura",
     "AX": "Eur1Fatura Tarihi",
     "AY": "Eur1 Sertifika",
     "AZ": "Fatura Tarihi",
@@ -284,6 +284,60 @@ def get_madde_blok(df: pd.DataFrame, start_idx: int, madde_adi: str):
 
     return blok
 
+def secili_sarfiyat_sayfasi(s1: pd.DataFrame, s2: pd.DataFrame = None):
+    # s2 parametresini isteğe bağlı yapıyoruz
+    if s2 is not None:
+        try:
+            parametreler = s1["Parametreler"].dropna().astype(str).str.lower()
+            if parametreler.str.contains(r"birim kullanım miktarı\s*\((kg|kilo)\)").any():
+                print("4. sarfiyat sayfası (kg) kullanıldı.")
+                return s2  # 4. sayfa
+            else:
+                print("3. sarfiyat sayfası kullanıldı.")
+                return s1  # 3. sayfa
+        except Exception as e:
+            print(f"Sarfiyat sayfası seçim hatası: {e}. Varsayılan olarak 3. sayfa kullanıldı.")
+            return s1  # varsayılan olarak s1 kullan
+    else:
+        print("Sadece 3. sarfiyat sayfası mevcut veya 4. sayfa kullanılmadı.")
+        return s1 # Sadece 3. sayfa varsa onu kullan
+
+def birim_turleri_satir4ten(sarfiyat_df: pd.DataFrame, use_second_unit_sheet: bool):
+    """
+    3. veya 4. sayfadaki sarfiyat sayfasının 3. (kod) ve 4. (birim) satırlarından ürün birimi belirler.
+    Dönüş: {ürün_kodu: "kg" | "non-kg"}
+    """
+    birim_map = {}
+    if not use_second_unit_sheet:
+        st.info("İkinci birim sayfası kullanılmadığı için birim türleri 3. sayfadan belirleniyor.")
+        # Eğer 2. birim sayfası kullanılmıyorsa, tüm birimleri 'non-kg' olarak varsayabiliriz
+        # veya sarfiyat_df_all'dan ilgili satırları çekip birim türünü belirleyebiliriz.
+        # Basitçe 'non-kg' varsayımı:
+        for col in sarfiyat_df.columns:
+            if col not in ["Madde Adı", "Parametreler"]:
+                birim_map[str(col)] = "non-kg" # Satır kodları kolon başlıklarında
+        return birim_map
+
+    try:
+        kod_satiri = sarfiyat_df.iloc[2]  # Satır kodları
+        birim_satiri = sarfiyat_df.iloc[3]  # Birim bilgileri
+
+        for col in sarfiyat_df.columns:
+            if col in ["Madde Adı", "Parametreler"]:
+                continue
+            urun_kodu = str(kod_satiri[col]).strip()
+            birim = str(birim_satiri[col]).strip().lower()
+
+            if urun_kodu == "" or birim == "":
+                continue
+            elif "kg" in birim or "kilo" in birim:
+                birim_map[urun_kodu] = "kg"
+            else:
+                birim_map[urun_kodu] = "non-kg"
+    except Exception as e:
+        st.warning(f"Birim türü alınamadı: {e}")
+    return birim_map
+
 st.set_page_config(page_title="İthalat ve İhracat Raporları", page_icon="📊", layout="wide")
 
 st.title("İthalat ve İhracat Verilerini Yükleyin")
@@ -302,7 +356,10 @@ if uploaded_file is not None:
     if len(sheet_names) >= 3:
         ithalat_df_all = data[sheet_names[0]]
         ihracat_df_all = data[sheet_names[1]]
-        sarfiyat_df_all = data[sheet_names[2]]
+        sarfiyat1 = data[sheet_names[2]] # 3. sayfa her zaman var
+
+        sarfiyat2_exists = len(sheet_names) >= 4 # 4. sayfa var mı kontrol et
+        sarfiyat2 = data[sheet_names[3]] if sarfiyat2_exists else None
 
         ithalat_df = filter_imports(ithalat_df_all)
         ithalat_pivot = ithalat_df.groupby(['Satır Kodu'])['İstatistiki Miktar'].sum().reset_index().rename(columns={'İstatistiki Miktar': 'Toplam İstatistiki Miktar'})
@@ -313,6 +370,10 @@ if uploaded_file is not None:
         ozel_df = ihracat_df_all[ihracat_df_all['Varış Ülkesi'].isin(OZEL_ULKELER)]
         kontrol_df = ozel_df.copy() if not ozel_df.empty else pd.DataFrame()
 
+        # Sarfiyat sayfası seçimi
+        sarfiyat_df_all = secili_sarfiyat_sayfasi(sarfiyat1, sarfiyat2)
+        st.info("Kullanılan sarfiyat sayfası: " + (sheet_names[3] if sarfiyat2_exists and sarfiyat_df_all.equals(data[sheet_names[3]]) else sheet_names[2]))
+
         # SARFİYAT: satır kodu hem "Madde Adı" sütununda hem de kolon adlarında kontrol edilir
         sarfiyat_df = None
         if sarfiyat_df_all is not None:
@@ -321,18 +382,10 @@ if uploaded_file is not None:
 
             satir_maskesi = sarfiyat_df_all['Madde Adı'].astype(str).isin(ithalat_kodlari)
             kolonlar = ['Madde Adı', 'Parametreler'] + [col for col in sarfiyat_df_all.columns if str(col) in dunya_kodlari]
-
-            sarfiyat_df = sarfiyat_df_all[satir_maskesi][kolonlar]
             
-        # SARFİYAT: Satır kodu hem Madde Adı'nda hem de kolon adlarında kontrol edilir
-        sarfiyat_df = None
-        if sarfiyat_df_all is not None:
-            ithalat_kodlari = ithalat_pivot['Satır Kodu'].astype(str).unique()
-            dunya_kodlari = non_ab_pivot['Satır Kodu'].astype(str).unique()
-
-            satir_maskesi = sarfiyat_df_all['Madde Adı'].astype(str).isin(ithalat_kodlari)
-            kolonlar = ['Madde Adı', 'Parametreler'] + [col for col in sarfiyat_df_all.columns if str(col) in dunya_kodlari]
-
+            # Tüm kolonların sarfiyat_df_all içinde olduğundan emin olun
+            kolonlar = [col for col in kolonlar if col in sarfiyat_df_all.columns]
+            
             sarfiyat_df_filtered = sarfiyat_df_all[satir_maskesi][kolonlar]
 
             # İthalat pivotuyla birleştir ve yeni sütunu ekle
@@ -348,12 +401,14 @@ if uploaded_file is not None:
         # 3. Dünya Ülkeleri Pivot verisini alın
         dunya_pivot_dict = dict(zip(non_ab_pivot['Satır Kodu'].astype(str), non_ab_pivot['Toplam Miktar']))
 
+        birim_turleri = birim_turleri_satir4ten(sarfiyat_df_all, sarfiyat2_exists)
+
         # Yeni "Toplam Miktar" satırını oluştur
         toplam_miktar_row = {
             "Madde Adı": "",
             "Parametreler": "Toplam Miktar"
         }
-
+        
         # Tablodaki sarfiyat kolonları üzerinde dön
         for col in sarfiyat_df.columns:
             if col in dunya_pivot_dict:
@@ -368,29 +423,46 @@ if uploaded_file is not None:
         ], ignore_index=True)
         
         # Kullanıcıdan gelen sarfiyat tablosunun 3. satırı (index 2), ürün adlarını içeriyor
-        urun_adi_satiri = sarfiyat_df_all.iloc[3]
+        # sarfiyat_df_all, seçilen sarfiyat sayfasıdır (sarfiyat1 veya sarfiyat2)
+        urun_adi_satiri_3 = sarfiyat1.iloc[3] # 3. sayfanın 4. satırı (ürün adları)
 
-        # Yeni satır: Kullanılan Ürün
-        kullanilan_urun_row = {
+        # Yeni satır: Kullanılan Ürün (3. Sayfadan)
+        kullanilan_urun_row_3 = {
             "Madde Adı": "",
             "Parametreler": "Kullanılan Ürün"
         }
 
-        # Her ürün kolonu için ürün adını al
         for col in sarfiyat_df.columns:
-            if col not in ["Madde Adı", "Parametreler"] and col in urun_adi_satiri.index:
-                kullanilan_urun_row[col] = urun_adi_satiri[col]
+            if col not in ["Madde Adı", "Parametreler"] and col in urun_adi_satiri_3.index:
+                kullanilan_urun_row_3[col] = urun_adi_satiri_3[col]
 
         # "Toplam Miktar" satırı zaten en başta
-        # Şimdi onun altına "Kullanılan Ürün" satırını ekle
         sarfiyat_df = pd.concat([
             sarfiyat_df.iloc[[0]],                          # Toplam Miktar
-            pd.DataFrame([kullanilan_urun_row]),           # Kullanılan Ürün
+            pd.DataFrame([kullanilan_urun_row_3]),         # Kullanılan Ürün (3. Sayfa)
             sarfiyat_df.iloc[1:]                           # Kalan sarfiyat
         ], ignore_index=True)
-        
 
-        # Blok bazlı: Fire ve Toplam Birim Kullanım satırlarını "Birim Kullanım"ın altına ekle
+        # Eğer 4. sayfa varsa ve kullanılıyorsa, "2.Br Birim Kullanım" satırını ekle
+        if sarfiyat2_exists and sarfiyat_df_all.equals(sarfiyat2):
+            urun_adi_satiri_4 = sarfiyat2.iloc[1] # 4. sayfanın 2. satırı (örneğin C3:D3:E3:F3 gibi satır varsa index=1)
+
+            kullanilan_urun_row_4 = {col: "" for col in sarfiyat_df.columns}
+            kullanilan_urun_row_4["Madde Adı"] = "2.Br Birim Kullanım"
+            kullanilan_urun_row_4["Parametreler"] = ""
+
+            for col in sarfiyat_df.columns:
+                if col not in ["Madde Adı", "Parametreler"] and col in urun_adi_satiri_4.index:
+                    kullanilan_urun_row_4[col] = urun_adi_satiri_4[col]
+            
+            # "Toplam Miktar" ve "Kullanılan Ürün (3. Sayfa)" satırından sonra ekle
+            sarfiyat_df = pd.concat([
+                sarfiyat_df.iloc[[0,1]],                  # Toplam Miktar, Kullanılan Ürün (3. Sayfa)
+                pd.DataFrame([kullanilan_urun_row_4]),    # Kullanılan Ürün (4. Sayfa)
+                sarfiyat_df.iloc[2:]                      # Diğer satırlar
+            ], ignore_index=True)
+        
+        # Fire ve Toplam Birim Kullanım satırlarını ekleme
         yeni_sarfiyat_df = pd.DataFrame(columns=sarfiyat_df.columns)
 
         i = 0
@@ -400,19 +472,27 @@ if uploaded_file is not None:
 
             if "birim kullanım miktarı" in str(satir["Parametreler"]).lower():
                 madde_adi = satir["Madde Adı"]
+                parametre = str(satir["Parametreler"]).lower() if pd.notnull(satir["Parametreler"]) else ""
 
-                match_index = sarfiyat_df_all[
-                    (sarfiyat_df_all["Madde Adı"] == madde_adi) &
-                    (sarfiyat_df_all["Parametreler"].str.lower().str.contains("birim kullanım miktarı"))
+                # Parantez içindeki birimi al (regex ile)
+                match = re.search(r'\((.*?)\)', parametre)
+                parantez_ici = match.group(1) if match else ""
+
+                # Kaynak sayfa seçimi
+                kaynak_sarfiyat = sarfiyat_df_all # Sarfiyat_df_all zaten seçilen (3. veya 4.) sayfayı temsil ediyor
+
+                match_index = kaynak_sarfiyat[
+                    (kaynak_sarfiyat["Madde Adı"] == madde_adi) &
+                    (kaynak_sarfiyat["Parametreler"].str.lower().str.contains("birim kullanım miktarı"))
                 ].index
 
                 if not match_index.empty:
-                    blok_satirlari = get_madde_blok(sarfiyat_df_all, match_index[0], madde_adi)
-                    for row in blok_satirlari[1:]:  # ilk satır zaten eklendi
+                    blok_satirlari = get_madde_blok(kaynak_sarfiyat, match_index[0], madde_adi)
+                    for row_blok in blok_satirlari[1:]:  # ilk satır zaten eklendi
                         yeni_row = {col: "" for col in sarfiyat_df.columns}
                         for col in sarfiyat_df.columns:
-                            if col in row:
-                                yeni_row[col] = row[col]
+                            if col in row_blok:
+                                yeni_row[col] = row_blok[col]
                         yeni_sarfiyat_df.loc[len(yeni_sarfiyat_df)] = yeni_row
 
             i += 1
@@ -431,33 +511,61 @@ if uploaded_file is not None:
                 mamul_row["Madde Adı"] = madde_adi
                 mamul_row["Parametreler"] = "Toplam Mamul Kullanımı"
 
+                parametre = str(satir["Parametreler"]).lower() if pd.notnull(satir["Parametreler"]) else ""
+                match = re.search(r'\((.*?)\)', parametre)
+                birim_turu = match.group(1).lower() if match else ""
+
+                # Fire satırını bul
+                fire_row_index = -1
+                if i + 1 < len(sarfiyat_df):
+                    temp_fire_row = sarfiyat_df.iloc[i + 1]
+                    if str(temp_fire_row["Parametreler"]).lower().startswith("fire"):
+                        fire_row_index = i + 1
+
+                # Toplam Birim Kullanım satırını bul
+                toplam_birim_kullanim_row_index = -1
+                if fire_row_index != -1 and i + 2 < len(sarfiyat_df): # Fire satırı varsa 2. sonrakine bak
+                    temp_toplam_row = sarfiyat_df.iloc[i + 2]
+                    if str(temp_toplam_row["Parametreler"]).strip().lower() == "toplam birim kullanım":
+                        toplam_birim_kullanim_row_index = i + 2
+                elif fire_row_index == -1 and i + 1 < len(sarfiyat_df): # Fire satırı yoksa 1. sonrakine bak
+                    temp_toplam_row = sarfiyat_df.iloc[i + 1]
+                    if str(temp_toplam_row["Parametreler"]).strip().lower() == "toplam birim kullanım":
+                        toplam_birim_kullanim_row_index = i + 1
+
+                toplam_birim_kullanim_row = sarfiyat_df.iloc[toplam_birim_kullanim_row_index] if toplam_birim_kullanim_row_index != -1 else None
+
+
                 for col in sarfiyat_df.columns:
-                    if col not in ["Madde Adı", "Parametreler"] and pd.notna(satir[col]):
+                    if col not in ["Madde Adı", "Parametreler"] and toplam_birim_kullanim_row is not None and pd.notna(toplam_birim_kullanim_row.get(col)):
                         try:
-                            birim = float(satir[col])
-                            miktar = float(toplam_miktar_row.get(col, 0))
-                            mamul_row[col] = birim * miktar
-                        except:
+                            toplam_birim_kullanim = float(toplam_birim_kullanim_row[col])
+                            
+                            if "kg" in birim_turu or "kilo" in birim_turu:
+                                katsayi = 1.0 # Varsayılan katsayı
+                                if sarfiyat2_exists and sarfiyat_df_all.equals(sarfiyat2): # Eğer 4. sayfa kullanılıyorsa katsayıyı oradan al
+                                    ikinci_birim_row = sarfiyat_df[sarfiyat_df["Madde Adı"] == "2.Br Birim Kullanım"].iloc[0]
+                                    if col in ikinci_birim_row and pd.notna(ikinci_birim_row[col]):
+                                        katsayi = float(ikinci_birim_row[col])
+                                mamul_row[col] = toplam_birim_kullanim * katsayi
+                            elif any(x in birim_turu for x in ["litre", "metre", "adet"]):
+                                miktar = float(toplam_miktar_row.get(col, 0))
+                                mamul_row[col] = toplam_birim_kullanim * miktar
+                            else: # Bilinmeyen birim türleri için doğrudan toplam birim kullanımı alınabilir
+                                mamul_row[col] = toplam_birim_kullanim
+                        except Exception as e:
                             mamul_row[col] = ""
+            
+                yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = satir # Birim kullanım satırını ekle
 
-                yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = satir
+                if fire_row_index != -1:
+                    yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = sarfiyat_df.iloc[fire_row_index] # Fire satırını ekle
+                    i += 1
+                if toplam_birim_kullanim_row_index != -1:
+                    yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = sarfiyat_df.iloc[toplam_birim_kullanim_row_index] # Toplam Birim Kullanım satırını ekle
+                    i += 1
 
-                # 2. Fire satırı varsa ekle
-                if i + 1 < len(sarfiyat_df):
-                    fire_row = sarfiyat_df.iloc[i + 1]
-                    if str(fire_row["Parametreler"]).lower().startswith("fire"):
-                        yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = fire_row
-                        i += 1
-
-                # 3. Toplam Birim Kullanım varsa ekle
-                if i + 1 < len(sarfiyat_df):
-                    toplam_row = sarfiyat_df.iloc[i + 1]
-                    if str(toplam_row["Parametreler"]).strip().lower() == "toplam birim kullanım":
-                        yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = toplam_row
-                        i += 1
-
-                # 4. En son: Toplam Mamul Kullanımı'nı ekle
-                yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = mamul_row
+                yeni_df_with_mamul.loc[len(yeni_df_with_mamul)] = mamul_row # Toplam Mamul Kullanımı'nı ekle
                 
 
             else:
@@ -473,35 +581,110 @@ if uploaded_file is not None:
 
         # 1. "Toplam Mamul Kullanımı" satırlarını filtrele
         mamul_maskesi = sarfiyat_df["Parametreler"] == "Toplam Mamul Kullanımı"
-        mamul_satirlari = sarfiyat_df[mamul_maskesi].copy()
-        
-        for idx, row in sarfiyat_df[mamul_maskesi].iterrows():
-            madde_adi = row["Madde Adı"]
-            
-            # Aynı madde adına sahip satırdan gerçekleşen ithalatı bul
-            ithalat_degeri = sarfiyat_df.loc[
-                (sarfiyat_df["Madde Adı"] == madde_adi) &
-                (sarfiyat_df["Parametreler"].str.lower().str.startswith("birim kullanım miktarı"))
-            ]["Gerçekleşen İthalat Miktarı"]
 
-            if not ithalat_degeri.empty:
-                sarfiyat_df.at[idx, "Gerçekleşen İthalat Miktarı"] = ithalat_degeri.values[0]
-
-        # 2. Her satırdaki sayısal sütunları toplayarak yeni sütun ekle
-        sarfiyat_df.loc[mamul_maskesi, "Toplam Mamul Kullanımı"] = mamul_satirlari.apply(
-            lambda row: sum([float(row[col]) for col in sarfiyat_df.columns if col not in ["Madde Adı", "Parametreler"] and pd.notna(row[col]) and isinstance(row[col], (int, float))]),
+        # "Toplam Mamul Kullanımı Toplam" sütununu oluştur ve her satırın yatay toplamını yaz
+        sarfiyat_df.loc[mamul_maskesi, "Toplam Mamul Kullanımı Toplam"] = sarfiyat_df[mamul_maskesi].apply(
+            lambda row: sum([
+                pd.to_numeric(row[col], errors='coerce') for col in sarfiyat_df.columns
+                if col not in ["Madde Adı", "Parametreler", "Gerçekleşen İthalat Miktarı", "Fark", "TEV Durumu", "Toplam Mamul Kullanımı Toplam"]
+                and pd.notna(row[col])
+            ]),
             axis=1
         )
-        # Fark ve TEV durumu hesapla (yalnızca mamul satırları için)
+
+        for idx, row in sarfiyat_df[mamul_maskesi].iterrows():
+            madde_adi = row["Madde Adı"]
+
+            # Birim Kullanım Miktarı satırını bul
+            birim_kullanim_satiri = sarfiyat_df[
+                (sarfiyat_df["Madde Adı"] == madde_adi) &
+                (sarfiyat_df["Parametreler"].str.lower().str.startswith("birim kullanım miktarı"))
+            ]
+
+            if birim_kullanim_satiri.empty:
+                continue
+
+            parametre = birim_kullanim_satiri.iloc[0]["Parametreler"]
+            match = re.search(r'\((.*?)\)', str(parametre))
+            birim_turu = match.group(1).lower() if match else ""
+
+            toplam_birim_kullanim_row_found = False
+            toplam_birim_kullanim_row = None
+            
+            # Fire satırı var mı kontrol et
+            current_idx_of_birim_kullanim = sarfiyat_df.index.get_loc(idx) - (2 if sarfiyat2_exists and sarfiyat_df_all.equals(sarfiyat2) else 1) # Güncel mamul satırının üstündeki birim kullanım satırının index'i
+            
+            if current_idx_of_birim_kullanim + 2 < len(sarfiyat_df): # Fire ve Toplam Birim Kullanım satırları olabilir
+                if str(sarfiyat_df.iloc[current_idx_of_birim_kullanim + 1]["Parametreler"]).lower().startswith("fire"): # Fire satırı varsa
+                    if current_idx_of_birim_kullanim + 2 < len(sarfiyat_df) and str(sarfiyat_df.iloc[current_idx_of_birim_kullanim + 2]["Parametreler"]).strip().lower() == "toplam birim kullanım":
+                        toplam_birim_kullanim_row = sarfiyat_df.iloc[current_idx_of_birim_kullanim + 2]
+                        toplam_birim_kullanim_row_found = True
+                elif str(sarfiyat_df.iloc[current_idx_of_birim_kullanim + 1]["Parametreler"]).strip().lower() == "toplam birim kullanım": # Fire satırı yok ama Toplam Birim Kullanım satırı varsa
+                    toplam_birim_kullanim_row = sarfiyat_df.iloc[current_idx_of_birim_kullanim + 1]
+                    toplam_birim_kullanim_row_found = True
+
+            if not toplam_birim_kullanim_row_found:
+                continue # Toplam birim kullanım satırı bulunamazsa bu maddeyi atla
+
+            mamul_row_calculated = {col: "" for col in sarfiyat_df.columns}
+            mamul_row_calculated["Madde Adı"] = madde_adi
+            mamul_row_calculated["Parametreler"] = "Toplam Mamul Kullanımı"
+
+            for col in sarfiyat_df.columns:
+                if col in ["Madde Adı", "Parametreler"]:
+                    continue
+                try:
+                    toplam_birim_kullanim = float(toplam_birim_kullanim_row.get(col, 0))
+
+                    if "kg" in birim_turu or "kilo" in birim_turu:
+                        katsayi = 1.0 # Varsayılan katsayı
+                        if sarfiyat2_exists and sarfiyat_df_all.equals(sarfiyat2): # Eğer 4. sayfa kullanılıyorsa katsayıyı oradan al
+                            ikinci_birim_row_filtered = sarfiyat_df[sarfiyat_df["Madde Adı"] == "2.Br Birim Kullanım"]
+                            if not ikinci_birim_row_filtered.empty and col in ikinci_birim_row_filtered.iloc[0] and pd.notna(ikinci_birim_row_filtered.iloc[0][col]):
+                                katsayi = float(ikinci_birim_row_filtered.iloc[0][col])
+                        mamul_row_calculated[col] = toplam_birim_kullanim * katsayi
+
+                    elif any(x in birim_turu for x in ["litre", "metre", "adet"]):
+                        toplam_miktar = toplam_miktar_row.get(col, 0)
+                        mamul_row_calculated[col] = toplam_birim_kullanim * toplam_miktar
+                    else:
+                        mamul_row_calculated[col] = toplam_birim_kullanim # Varsayılan olarak direkt toplam birim kullanımı
+
+                except Exception as e:
+                    mamul_row_calculated[col] = ""
+                    
+            # Mamul satırını güncelle
+            for k, v in mamul_row_calculated.items():
+                sarfiyat_df.loc[idx, k] = v
+
+        # Toplam Mamul Kullanımı Toplamını tekrar hesapla
+        sarfiyat_df.loc[mamul_maskesi, "Toplam Mamul Kullanımı Toplam"] = sarfiyat_df[mamul_maskesi].apply(
+            lambda row: sum(
+                pd.to_numeric(row[col], errors='coerce') 
+                for col in sarfiyat_df.columns 
+                if col not in ["Madde Adı", "Parametreler", "Gerçekleşen İthalat Miktarı", "Fark", "TEV Durumu", "Toplam Mamul Kullanımı Toplam"]
+            ) if row["Parametreler"] == "Toplam Mamul Kullanımı" else "", axis=1
+        )
+
+
+        for idx, row in sarfiyat_df[mamul_maskesi].iterrows():
+            madde_adi = row["Madde Adı"]
+            # ithalat_pivot'tan ilgili Madde Adı'nın Toplam İstatistiki Miktarını bul
+            ithalat_miktar_row = ithalat_pivot[ithalat_pivot['Satır Kodu'] == madde_adi]
+            if not ithalat_miktar_row.empty:
+                sarfiyat_df.loc[idx, "Gerçekleşen İthalat Miktarı"] = ithalat_miktar_row.iloc[0]['Toplam İstatistiki Miktar']
+            else:
+                sarfiyat_df.loc[idx, "Gerçekleşen İthalat Miktarı"] = 0 
+                
         sarfiyat_df.loc[mamul_maskesi, "Fark"] = (
-            sarfiyat_df.loc[mamul_maskesi, "Toplam Mamul Kullanımı"] -
-            sarfiyat_df.loc[mamul_maskesi, "Gerçekleşen İthalat Miktarı"]
+            pd.to_numeric(sarfiyat_df.loc[mamul_maskesi, "Toplam Mamul Kullanımı Toplam"], errors='coerce') -
+            pd.to_numeric(sarfiyat_df.loc[mamul_maskesi, "Gerçekleşen İthalat Miktarı"], errors='coerce')
         )
 
         sarfiyat_df.loc[mamul_maskesi, "TEV Durumu"] = sarfiyat_df.loc[mamul_maskesi, "Fark"].apply(
             lambda x: "TEV Var" if pd.notna(x) and x < 0 else "TEV Yok"
         )
-        
+                    
 
         # Görselleştirme
         if selected_option == 'Gerç.İth.List.':
@@ -542,4 +725,3 @@ if uploaded_file is not None:
 
         output_combined.seek(0)
         st.download_button("Tüm Verileri İndir", data=output_combined, file_name="tüm_veriler_raporu.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
